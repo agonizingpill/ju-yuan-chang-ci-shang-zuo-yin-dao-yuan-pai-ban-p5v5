@@ -1,4 +1,4 @@
-from sqlalchemy import String,Integer,Float,ForeignKey,Date,JSON,CheckConstraint,UniqueConstraint
+from sqlalchemy import String,Integer,Float,ForeignKey,Date,JSON,Text,CheckConstraint,UniqueConstraint
 from sqlalchemy.orm import Mapped,mapped_column
 from datetime import date as DateValue
 from .db import Base
@@ -44,3 +44,11 @@ class Audit(Base):
     actor:Mapped[str]=mapped_column(String(100))
     action:Mapped[str]=mapped_column(String(200))
     stamp:Mapped[str]=mapped_column(String(40))
+class PerformanceCancellation(Base):
+    __tablename__='performance_cancellations'
+    __table_args__=(CheckConstraint('length(reason) >= 2'),)
+    id:Mapped[int]=mapped_column(primary_key=True)
+    performance_id:Mapped[int]=mapped_column(ForeignKey('performances.id'),unique=True)
+    reason:Mapped[str]=mapped_column(Text)
+    registered_by:Mapped[str]=mapped_column(String(100))
+    registered_at:Mapped[str]=mapped_column(String(40))

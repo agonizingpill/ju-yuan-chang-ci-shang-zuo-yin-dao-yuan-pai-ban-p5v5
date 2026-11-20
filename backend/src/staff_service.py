@@ -4,7 +4,7 @@ from fastapi import HTTPException
 from .models import CrewCall,Performance,Production
 from .staff_models import StaffMember,CrewAssignment
 from .debrief_models import ShowDebrief
-from .services import get,pack,audit
+from .services import get,pack,audit,lock_production
 
 def locked(s,cls,id):
     x=s.scalar(select(cls).where(cls.id==id).with_for_update().execution_options(populate_existing=True))
@@ -12,7 +12,13 @@ def locked(s,cls,id):
     return x
 
 def call_context(s,id):
-    c=locked(s,CrewCall,id);p=locked(s,Performance,c.performance_id)
+    # Lock order is production → performance → call everywhere, so confirming a
+    # call cannot deadlock against cancelling a performance or publishing a week.
+    preview=s.get(CrewCall,id)
+    if not preview:raise HTTPException(404,'人员、点名单或场次不存在')
+    perf_preview=s.get(Performance,preview.performance_id)
+    lock_production(s,perf_preview.production_id)
+    p=locked(s,Performance,preview.performance_id);c=locked(s,CrewCall,id)
     if c.status!='confirmed' or p.status!='crew_confirmed':raise HTTPException(409,'仅经理已确认的点名单可以实名排班与到岗')
     return c,p,get(s,Production,p.production_id)
 

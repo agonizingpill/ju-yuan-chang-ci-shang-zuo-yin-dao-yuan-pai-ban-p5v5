@@ -1,4 +1,4 @@
-from pydantic import BaseModel,Field
+from pydantic import BaseModel,Field,field_validator
 from datetime import date,datetime
 class Login(BaseModel):
     email:str
@@ -15,6 +15,15 @@ class PerformanceInput(BaseModel):
     arrivals:int|None=Field(default=None,ge=0,le=3000)
 class ArrivalInput(BaseModel):
     arrivals:int=Field(ge=0,le=3000)
+class CancellationInput(BaseModel):
+    reason:str=Field(min_length=2,max_length=500)
+    @field_validator('reason')
+    @classmethod
+    def nonblank(cls,v):
+        if not v.strip():raise ValueError('请填写停演原因')
+        return v.strip()
+class DayCancellationInput(CancellationInput):
+    date:date
 class CrewInput(BaseModel):
     performance_id:int
     ushers:int=Field(ge=1,le=80)

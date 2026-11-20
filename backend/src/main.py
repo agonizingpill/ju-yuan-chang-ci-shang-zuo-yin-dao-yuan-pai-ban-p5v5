@@ -6,10 +6,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from .db import Base,engine,db_session
-from .models import User,Production,Performance,CrewCall,Audit
+from .models import User,Production,Performance,CrewCall,Audit,PerformanceCancellation
 from .auth import current,writers,admin,verify,token
-from .schemas import Login,ProductionInput,PerformanceInput,ArrivalInput,CrewInput
-from .services import get,pack,audit,history,validate_history,invalidate,save_crew,confirm
+from .schemas import Login,ProductionInput,PerformanceInput,ArrivalInput,CrewInput,CancellationInput,DayCancellationInput
+from .services import get,pack,audit,calendar_status,invalidate,save_crew,confirm,cancel_performance,lock_production
 from .middlewares import RequestTrace,BurstGuard
 from .frontdesk_routes import router as frontdesk_router
 from .house_routes import router as house_router
@@ -48,6 +48,9 @@ def add_production(p:ProductionInput,s=Depends(db_session),u=Depends(admin)):
     v=Production(**p.model_dump());s.add(v);audit(s,u,'登记剧目 '+p.code);s.commit();return pack(v)
 @app.put('/productions/{pid}')
 def edit_production(pid:int,p:ProductionInput,s=Depends(db_session),u=Depends(admin)):
+    # Lock the publication slot first so a concurrent cancellation cannot clear an
+    # old week and then be overwritten by this revision's stale forecast evidence.
+    lock_production(s,pid)
     v=get(s,Production,pid);invalidate(s,v)
     if s.scalar(select(Performance.id).where(Performance.production_id==pid,Performance.arrivals>p.seats)):raise HTTPException(409,'座位数小于既有验票人数，不能修改')
     for k,value in p.model_dump().items():setattr(v,k,value)
@@ -59,14 +62,17 @@ def performances(production_id:int|None=None,s=Depends(db_session),u=Depends(cur
     return [pack(v) for v in s.scalars(q)]
 @app.post('/performances')
 def add_performance(p:PerformanceInput,s=Depends(db_session),u=Depends(writers)):
-    prod=get(s,Production,p.production_id)
+    get(s,Production,p.production_id);prod=lock_production(s,p.production_id)
     if p.arrivals is not None and p.arrivals>prod.seats:raise HTTPException(409,'验票人数超过本场座位容量')
+    if p.arrivals is not None and s.scalar(select(PerformanceCancellation.id).join(Performance,Performance.id==PerformanceCancellation.performance_id).where(Performance.production_id==prod.id,Performance.date==p.date)):raise HTTPException(409,'该日期已登记停演，不能再补录验票；如属误登，请由经理处理停演记录')
     invalidate(s,prod)
     v=Performance(**p.model_dump(),status='observed' if p.arrivals is not None else 'scheduled');s.add(v);audit(s,u,'登记场次 '+p.date.isoformat());s.commit();return pack(v)
 @app.patch('/performances/{fid}/arrivals')
 def arrivals(fid:int,p:ArrivalInput,s=Depends(db_session),u=Depends(writers)):
-    perf=get(s,Performance,fid);prod=get(s,Production,perf.production_id)
+    perf=get(s,Performance,fid);prod=lock_production(s,perf.production_id)
+    perf=s.scalar(select(Performance).where(Performance.id==fid).with_for_update().execution_options(populate_existing=True))
     if p.arrivals>prod.seats:raise HTTPException(409,'验票人数超过本场座位容量')
+    if perf.status=='cancelled':raise HTTPException(409,'本场已登记停演，不能补录验票')
     if perf.arrivals is None:raise HTTPException(409,'未来预测场次不能直接写验票；请通过新场次补录历史')
     invalidate(s,prod);perf.arrivals=p.arrivals;audit(s,u,'修订验票 '+str(perf.date));s.commit();return pack(perf)
 @app.post('/productions/{pid}/forecast')
@@ -75,10 +81,32 @@ def forecast(pid:int,s=Depends(db_session),u=Depends(writers)):
     if not prod:raise HTTPException(404,'剧目不存在')
     if s.scalar(select(Performance.id).where(Performance.production_id==pid,Performance.status=='crew_confirmed')):raise HTTPException(409,'已有确认点名，预测证据已冻结')
     if prod.forecast_state=='calculating':raise HTTPException(409,'预测进行中')
-    validate_history(history(s,pid));invalidate(s,prod);prod.forecast_state='calculating';audit(s,u,'预测入队 '+prod.code);s.commit()
+    # Publish the calculating state before enqueueing so the worker always sees it.
+    # Anything that invalidates this run afterwards (cancellation, input revision)
+    # bumps the state away from calculating, and the worker drops its stale result.
+    calendar_status(s,pid,raise_errors=True);invalidate(s,prod);prod.forecast_state='calculating';audit(s,u,'预测入队 '+prod.code);s.commit()
     try:r.rpush('theatre-forecast',pid)
     except Exception:prod.forecast_state='failed';s.commit();raise HTTPException(503,'预测队列暂不可用，请重试')
     return pack(prod)
+@app.post('/performances/{fid}/cancellation')
+def cancel(fid:int,p:CancellationInput,s=Depends(db_session),u=Depends(writers)):
+    perf=get(s,Performance,fid);v=cancel_performance(s,perf.production_id,perf.date,p.reason,u);s.commit();return pack(v)
+@app.post('/productions/{pid}/cancellations')
+def cancel_day(pid:int,p:DayCancellationInput,s=Depends(db_session),u=Depends(writers)):
+    get(s,Production,pid);v=cancel_performance(s,pid,p.date,p.reason,u);s.commit();return pack(v)
+@app.get('/cancellations')
+def cancellations(production_id:int|None=None,s=Depends(db_session),u=Depends(current)):
+    q=select(PerformanceCancellation,Performance).join(Performance,Performance.id==PerformanceCancellation.performance_id).order_by(Performance.date)
+    if production_id:q=q.where(Performance.production_id==production_id)
+    return [dict(pack(c),date=p.date.isoformat(),curtain=p.curtain,production_id=p.production_id) for c,p in s.execute(q).all()]
+def _status_view(ct):
+    return {'production_id':ct['production_id'],'first':ct['first'].isoformat() if ct['first'] else None,'last':ct['last'].isoformat() if ct['last'] else None,'recorded_days':len(ct['recorded']),'cancelled_days':sorted(p.date.isoformat() for _,p in ct['cancelled'].values()),'missing_days':[d.isoformat() for d in ct['missing']],'ready':ct['error'] is None,'error':ct['error']}
+@app.get('/calendar-status')
+def status_all(s=Depends(db_session),u=Depends(current)):
+    return [_status_view(calendar_status(s,pid)) for pid in s.scalars(select(Production.id).order_by(Production.id))]
+@app.get('/productions/{pid}/calendar-status')
+def status(pid:int,s=Depends(db_session),u=Depends(current)):
+    get(s,Production,pid);return _status_view(calendar_status(s,pid))
 @app.get('/crew-calls')
 def crews(s=Depends(db_session),u=Depends(current)):return [pack(v) for v in s.scalars(select(CrewCall).order_by(CrewCall.id))]
 @app.post('/crew-calls')

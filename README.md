@@ -6,9 +6,9 @@
 
 ## 业务模块
 
-- 演出日历：Production剧目与Performance场次关联，每剧目每天一场；剧目有座位容量与演出时长。
-- 验票历史：按日补录/修订真实范围的观众人数，不能超过座位；日期缺口阻止预测。
-- 上座预测：Python worker执行Holt-Winters周季节预测；更早49天训练、最近7天回测，再用56天预测下一周；页面展示回测误差、原始需求、座位封顶值和所需引导员。
+- 演出日历：Production剧目与Performance场次关联，每剧目每天一场；剧目有座位容量与演出时长。场务可登记停演，停演日保留原日期但不出预测、不点名。
+- 验票历史：按日补录/修订真实范围的观众人数，不能超过座位；日期缺口阻止预测。漏录可补验票，或经场务登记停演关闭缺口。
+- 上座预测：Python worker执行Holt-Winters周季节预测；更早49天训练、最近7天回测，再用56天预测下一周；页面展示回测误差、原始需求、座位封顶值和所需引导员。停演日不补零、不进误差；留出周验票不参与训练。
 - 实名到岗：已确认点名分配StaffMember到CrewAssignment，保留姓名编号快照；跨剧目占用时段重叠、停用或超个人每日上限拒配；现场到岗限点名时刻前后15分钟，登记后不可重复。
 - 散场交接：实名签到人数达到已确认配置才能保存ShowDebrief；实到人数不得超座位；散场>15分钟或上座偏差>30%须至少8字原因；领班可修订草稿，经理归档后冻结。
 - 场务点名：每40位预计观众至少1名引导员，向上取整，最少1名；点名须在开场前30分钟至6小时内；经理确认时检查人手与有效预测。成功确认关联场次状态。
@@ -45,7 +45,9 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 ## 算法与可复现口径
 
-输入是至少28天连续逐日验票序列。没有随机拆分：最后7天只做验证，前面的记录拟合statsmodels ExponentialSmoothing(trend=add,seasonal=add,seasonal_periods=7)；MAE=mean(abs(actual-predicted))。随后完整历史重拟合预测未来7天。原始需求=max(0,predicted)；排班人数基数=min(seats,ceil(raw))；所需引导员=max(1,ceil(base/40))。无随机拟合步骤，seed仅用于生成可复现模拟历史。参考数据是业务模拟，不代表真实剧院。
+输入是至少28天连续逐日验票序列。没有随机拆分：最后7天只做验证，前面的记录拟合statsmodels ExponentialSmoothing(trend=add,seasonal=add,seasonal_periods=7)；MAE=mean(abs(actual-predicted))，只对留出周里有验票的开演日求平均。随后完整历史重拟合预测未来7天。原始需求=max(0,predicted)；排班人数基数=min(seats,ceil(raw))；所需引导员=max(1,ceil(base/40))。无随机拟合步骤，seed仅用于生成可复现模拟历史。参考数据是业务模拟，不代表真实剧院。
+
+停演由场务登记（`POST /performances/{id}/cancellation` 或按日期 `POST /productions/{pid}/cancellations`），写入独立 `performance_cancellations` 表，不把停演补成 0 人。停演日保留原日期占位：不产生预测、不点名、不参与 MAE，训练时按同星期水平占位而不是补零。旧数据升级无回填：已录的 0 人照算真实开演日；未录验票且无停演记录的日期仍算漏录并阻止预测。未来七天按原日历日期连续排布，停演日列在 `skipped_future`。预测 worker 与停演登记共享 production 行的发布锁，排队期间被停演作废的结果整次丢弃，不会把刚停演的场次恢复为可排班。详见 `docs/cancellation.md`。
 
 结果写入Production.forecast_evidence、Performance.forecast/raw_forecast与backend/worker共享产物卷。没有前端假预测。缺日、少于28天或已确认点名均阻止建模。
 

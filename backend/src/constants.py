@@ -1,5 +1,5 @@
 ROLES=('admin','steward','viewer')
-PERFORMANCE_STATES=('observed','scheduled','forecasted','crew_confirmed')
+PERFORMANCE_STATES=('observed','scheduled','forecasted','crew_confirmed','cancelled')
 CALL_STATES=('proposed','confirmed','invalidated')
 
 DEBRIEF_STATES=('draft','archived')
